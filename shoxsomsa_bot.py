@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -159,7 +160,7 @@ def courier_kb(oid: str) -> InlineKeyboardMarkup:
 # ══════════════════════════════════════════
 #  BOT
 # ══════════════════════════════════════════
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp  = Dispatcher(storage=MemoryStorage())
 active_orders: dict[str, dict] = {}
 
