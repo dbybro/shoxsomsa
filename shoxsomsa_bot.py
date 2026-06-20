@@ -60,8 +60,10 @@ if not ADMIN_IDS:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Har bir DONAGA qo'shiladigan summa (1000 xizmat haqi + 5000 idish puli = 6000)
-SERVICE_FEE_PER_ITEM = 6_000
+# Ovqat narxiga (taom narxi + idish puli) qo'shiladi, va alohida mening haqqim
+DISH_FEE_PER_ITEM    = 5_000   # idish puli — ovqat narxiga singdiriladi
+SERVICE_FEE_PER_ITEM = 1_000   # mening haqqim — alohida ko'rsatiladi
+TOTAL_FEE_PER_ITEM   = DISH_FEE_PER_ITEM + SERVICE_FEE_PER_ITEM  # narxga qo'shiladigan jami
 
 # ──────────────────────────────────────────
 # ISH VAQTI — 09:00 dan 02:00 gacha (Toshkent vaqti, kunni kesib o'tadi)
@@ -244,14 +246,17 @@ RAW_MENU = {
     },
 }
 
+# MENU = menyuda ko'rinadigan narx (asl narx + mening haqqim)
 MENU: dict[str, dict[str, int]] = {
     cat: {name: price + SERVICE_FEE_PER_ITEM for name, price in items.items()}
     for cat, items in RAW_MENU.items()
 }
 
+# ALL_ITEMS = savatga qo'shilgandagi/checkout uchun yakuniy narx (menyu narxi + idish puli)
 ALL_ITEMS: dict[str, int] = {}
 for _cat in MENU.values():
-    ALL_ITEMS.update(_cat)
+    for _name, _menu_price in _cat.items():
+        ALL_ITEMS[_name] = _menu_price + DISH_FEE_PER_ITEM
 
 CATEGORY_IMAGES: dict[str, str] = {
     # "🫕 Sho'rvalar": "AgACAgI...",
@@ -291,13 +296,17 @@ def fmt(n: int) -> str:
 def cart_text(cart: dict) -> str:
     if not cart:
         return "Savatcha bo'sh"
-    lines, total = [], 0
+    lines, food_total = [], 0
     for name, qty in cart.items():
-        price = ALL_ITEMS[name]
-        sub   = price * qty
-        total += sub
+        menu_price = ALL_ITEMS[name] - DISH_FEE_PER_ITEM  # idishsiz, menyuda ko'ringan narx
+        sub = menu_price * qty
+        food_total += sub
         lines.append(f"• {name} × {qty} = {fmt(sub)}")
-    lines.append(f"\n💰 <b>Taomlar jami: {fmt(total)}</b>")
+    total_qty = sum(cart.values())
+    dish_fee  = total_qty * DISH_FEE_PER_ITEM
+    grand_total = food_total + dish_fee
+    lines.append(f"\n🍽️ Idish puli: {fmt(dish_fee)}")
+    lines.append(f"💰 <b>Jami: {fmt(grand_total)}</b>")
     lines.append("🚚 Yetkazib berish narxi admin tomonidan tasdiqlangach aytiladi.")
     return "\n".join(lines)
 
@@ -334,9 +343,9 @@ def categories_kb() -> InlineKeyboardMarkup:
 def items_kb(category: str, cart: dict | None = None) -> InlineKeyboardMarkup:
     cart = cart or {}
     rows = []
-    for name, price in MENU[category].items():
+    for name, menu_price in MENU[category].items():
         qty = cart.get(name, 0)
-        label = f"{name} — {fmt(price)}"
+        label = f"{name} — {fmt(menu_price)}"
         if qty > 0:
             label += f"  [🛒 {qty} ta]"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"item:{name}")])
