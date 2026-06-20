@@ -4,27 +4,34 @@
 SHOXSOMSA — Milliy Taomlar Telegram Bot
 Railway deployment uchun tayyor (env variables ishlatadi)
 
-Yangiliklar (oxirgi update):
-  - 📱 Telefon raqami FAQAT "Kontakt ulashish" tugmasi orqali (majburiy, xato bo'lmaydi)
-  - 📍 Geolokatsiya SO'RALADI + matn manzil ham so'raladi (ikkisi ham saqlanadi)
-  - 🛒 Savatga taom qo'shilganda endi shu taomdan nechta dona borligi ko'rsatiladi
-  - 🛒 Taom tugmalarida hozir savatda nechta dona borligi ko'rinadi
-  - 2 filial (Axsikent, Jasmin) — har biri o'z manzil/telefoni bilan
-  - To'liq menyu (93 taom, 5 kategoriya)
-  - Har bir dona uchun avtomatik +1000 so'm (narxga singdirilgan, ko'rinmaydi)
-  - Bir nechta admin, ish vaqti (09:00-02:00), admin qabul/rad tugmalari
+YANGI UPDATE (joriy):
+  - 🛒 Tezkor buyurtma: taom tugmasi bosilganda darhol savatga qo'shiladi,
+    har bir bosishdan keyin 3 tugma chiqadi: Yana qo'shish / Bekor qilish / Buyurtma berish
+  - 🍽️ Har bir TANLANGAN KATEGORIYA uchun +5000 so'm "idish puli" qo'shiladi
+    (5 ta kategoriyadan tanlasa = 5 x 5000 = 25000, faqat 1 kategoriyadan tanlasa = 5000)
+  - 👤 Ism-familiya endi SO'RALMAYDI — checkout to'g'ridan-to'g'ri telefondan boshlanadi
+  - 📞 Telefon raqami: kontakt tugmasi orqali + "Bu sizning raqamingizmi?" tasdiqlash bosqichi
+  - 📍 Geolokatsiya: majburiy, mustahkamlangan (boshqa narsa yuborilsa eslatma beradi)
+  - 🚚 Yetkazib berish narxi: ENDI BUYURTMADA YO'Q — admin buyurtmani qabul qilganda
+    qo'lda kiritadi, shundan keyin mijozga yakuniy summa yuboriladi
+  - 💾 PERSISTENCE: active_orders va order_counter endi /data/bot_data.json faylga
+    saqlanadi — bot qayta ishga tushganda (Railway restart/deploy) ma'lumot yo'qolmaydi
+  - 🐛 Bug fix: manzil kiritish bosqichida boshqa tugma (Menyu/Savatcha/Aloqa) bosilsa
+    endi noto'g'ri qabul qilinmaydi, foydalanuvchiga to'g'ri yo'naltiriladi
 """
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, TelegramObject,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
@@ -32,6 +39,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from typing import Callable, Awaitable, Any
 
 # ══════════════════════════════════════════
 #  SOZLAMALAR — Railway Environment Variables
@@ -39,12 +47,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
 COURIER_ID = int(os.environ["COURIER_ID"])
 
-# ──────────────────────────────────────────
-# BIR NECHTA ADMIN
-# Railway "Variables" bo'limida ADMIN_IDS ga vergul bilan ajratib yozing:
-#   ADMIN_IDS=123456789,987654321,555555555
-# Eski ADMIN_ID o'zgaruvchisi ham hali ishlaydi (orqaga moslik uchun).
-# ──────────────────────────────────────────
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS: list[int] = [
     int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip()
@@ -57,15 +59,15 @@ if not ADMIN_IDS:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-DELIVERY_PRICE = 10_000
-SERVICE_FEE_PER_ITEM = 1_000  # har bir dona ovqatga avtomatik qo'shiladigan summa (narxga singdiriladi)
+# Har bir TANLANGAN KATEGORIYA uchun bir martalik "idish puli"
+DISH_FEE_PER_CATEGORY = 5_000
 
 # ──────────────────────────────────────────
 # ISH VAQTI — 09:00 dan 02:00 gacha (Toshkent vaqti, kunni kesib o'tadi)
 # ──────────────────────────────────────────
 TIMEZONE   = ZoneInfo("Asia/Tashkent")
-OPEN_TIME  = time(9, 0)    # 09:00
-CLOSE_TIME = time(2, 0)    # 02:00 (keyingi kun)
+OPEN_TIME  = time(9, 0)
+CLOSE_TIME = time(2, 0)
 
 def is_open_now() -> bool:
     now = datetime.now(TIMEZONE).time()
@@ -79,6 +81,34 @@ def closed_message() -> str:
     )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
+
+# ══════════════════════════════════════════
+#  PERSISTENCE — active_orders va order_counter faylga saqlanadi
+#  Railway'da "Volume" ulangan bo'lsa /data ishlatiladi, bo'lmasa joriy papka.
+# ══════════════════════════════════════════
+DATA_DIR  = Path(os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "."))
+DATA_FILE = DATA_DIR / "bot_data.json"
+
+def load_data() -> tuple[dict, int]:
+    if DATA_FILE.exists():
+        try:
+            raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            return raw.get("active_orders", {}), raw.get("order_counter", 0)
+        except Exception as e:
+            logging.warning(f"Data faylini o'qishda xato: {e} — bo'sh holatda boshlanadi")
+    return {}, 0
+
+def save_data() -> None:
+    try:
+        DATA_FILE.write_text(
+            json.dumps(
+                {"active_orders": active_orders, "order_counter": order_counter},
+                ensure_ascii=False, indent=2
+            ),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        logging.warning(f"Data faylini saqlashda xato: {e}")
 
 # ══════════════════════════════════════════
 #  FILIALLAR
@@ -97,9 +127,8 @@ BRANCHES = {
 }
 
 # ══════════════════════════════════════════
-#  MENYU — asl narxlar (RAW), botda +1000/dona qo'shilib ko'rsatiladi
-#  Ikkala filialda hozircha bir xil narx (keyinroq filial bo'yicha
-#  farqlash kerak bo'lsa, BRANCH_MENU strukturasiga o'tkaziladi).
+#  MENYU — narxlar (idish puli endi kategoriya darajasida qo'shiladi,
+#  shuning uchun MENU = RAW_MENU, har bir taom narxi o'zgarmaydi)
 # ══════════════════════════════════════════
 RAW_MENU = {
     "🫕 Sho'rvalar": {
@@ -214,25 +243,19 @@ RAW_MENU = {
     },
 }
 
-# Botda ishlatiladigan yakuniy menyu — har bir narxga +SERVICE_FEE_PER_ITEM qo'shilgan
-MENU: dict[str, dict[str, int]] = {
-    cat: {name: price + SERVICE_FEE_PER_ITEM for name, price in items.items()}
-    for cat, items in RAW_MENU.items()
-}
+MENU: dict[str, dict[str, int]] = RAW_MENU
 
 ALL_ITEMS: dict[str, int] = {}
-for _cat in MENU.values():
-    ALL_ITEMS.update(_cat)
+# Har bir taom nomidan qaysi kategoriyaga tegishli ekanini bilish kerak
+# (idish puli kategoriya bo'yicha hisoblanadi)
+ITEM_CATEGORY: dict[str, str] = {}
+for _cat, _items in MENU.items():
+    ALL_ITEMS.update(_items)
+    for _name in _items:
+        ITEM_CATEGORY[_name] = _cat
 
-# ──────────────────────────────────────────
-# KATEGORIYA RASMLARI
-# Har bir kategoriya uchun Telegram file_id shu yerga yoziladi.
-# Avval botga rasmni yuboring, /getfileid buyrug'i bilan ID oling,
-# keyin shu lug'atga kategoriya nomi bilan bir xil kalit ostida qo'ying.
-# Bo'sh qoldirilgan kategoriyalar uchun rasm yuborilmaydi, faqat matn chiqadi.
-# ──────────────────────────────────────────
 CATEGORY_IMAGES: dict[str, str] = {
-    # "🫕 Sho'rvalar": "AgACAgI...",      # file_id shu yerga
+    # "🫕 Sho'rvalar": "AgACAgI...",
     # "🥟 Somsalar": "AgACAgI...",
     # "🍣 Sushi rollar": "AgACAgI...",
     # "🥗 Salatlar": "AgACAgI...",
@@ -243,28 +266,38 @@ CATEGORY_IMAGES: dict[str, str] = {
 #  HOLATLAR
 # ══════════════════════════════════════════
 class OrderState(StatesGroup):
-    choosing_branch   = State()
-    choosing_category = State()
-    choosing_item     = State()
-    entering_name     = State()
-    entering_phone    = State()    # kontakt tugmasi orqali kutilmoqda
-    entering_location = State()    # geolokatsiya kutilmoqda
-    entering_address  = State()    # matn manzil kutilmoqda
-    choosing_payment  = State()
-    confirming        = State()
+    choosing_branch    = State()
+    choosing_category  = State()
+    choosing_item      = State()
+    entering_phone     = State()
+    confirming_phone   = State()
+    entering_location   = State()
+    entering_address    = State()
+    choosing_payment    = State()
+    confirming          = State()
 
 # ══════════════════════════════════════════
 #  YORDAMCHILAR
 # ══════════════════════════════════════════
-order_counter = 0
+active_orders, order_counter = load_data()
 
 def next_order_id() -> str:
     global order_counter
     order_counter += 1
+    save_data()
     return f"SHX-{order_counter:03d}"
 
 def fmt(n: int) -> str:
     return f"{n:,} so'm".replace(",", " ")
+
+def cart_categories(cart: dict) -> set[str]:
+    return {ITEM_CATEGORY[name] for name in cart if name in ITEM_CATEGORY}
+
+def cart_items_total(cart: dict) -> int:
+    return sum(ALL_ITEMS[n] * q for n, q in cart.items())
+
+def cart_dish_fee(cart: dict) -> int:
+    return len(cart_categories(cart)) * DISH_FEE_PER_CATEGORY
 
 def cart_text(cart: dict) -> str:
     if not cart:
@@ -275,14 +308,15 @@ def cart_text(cart: dict) -> str:
         sub   = price * qty
         total += sub
         lines.append(f"• {name} × {qty} = {fmt(sub)}")
-    lines += [
-        f"\n🚚 Yetkazib berish: {fmt(DELIVERY_PRICE)}",
-        f"💰 <b>Jami: {fmt(total + DELIVERY_PRICE)}</b>",
-    ]
+    dish_fee = cart_dish_fee(cart)
+    n_cats   = len(cart_categories(cart))
+    lines.append(f"\n🍽️ Idish puli ({n_cats} turdagi taom): {fmt(dish_fee)}")
+    lines.append(f"💰 <b>Taomlar jami: {fmt(total + dish_fee)}</b>")
+    lines.append("🚚 Yetkazib berish narxi admin tomonidan tasdiqlangach aytiladi.")
     return "\n".join(lines)
 
-def cart_total_qty(cart: dict) -> int:
-    return sum(cart.values())
+def cart_grand_total(cart: dict) -> int:
+    return cart_items_total(cart) + cart_dish_fee(cart)
 
 PAY_LABELS = {
     "cash": "💵 Naqd pul", "card": "💳 Karta",
@@ -323,17 +357,27 @@ def items_kb(category: str, cart: dict | None = None) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back:categories")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def cart_kb() -> InlineKeyboardMarkup:
+def after_add_kb() -> InlineKeyboardMarkup:
+    """Taom savatga qo'shilgandan keyin chiqadigan 3 tugma."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Yana qo'shish",  callback_data="cart:add_more")],
-        [InlineKeyboardButton(text="🗑️ Tozalash",       callback_data="cart:clear")],
-        [InlineKeyboardButton(text="✅ Buyurtma berish", callback_data="cart:checkout")],
+        [InlineKeyboardButton(text="➕ Yana qo'shish",   callback_data="cart:add_more")],
+        [InlineKeyboardButton(text="🗑️ Bekor qilish",    callback_data="cart:clear")],
+        [InlineKeyboardButton(text="✅ Buyurtma berish",  callback_data="cart:checkout")],
     ])
+
+def cart_kb() -> InlineKeyboardMarkup:
+    return after_add_kb()
 
 def phone_request_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📱 Raqamni ulashish", request_contact=True)],
     ], resize_keyboard=True, one_time_keyboard=True)
+
+def phone_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, to'g'ri", callback_data="phone:yes")],
+        [InlineKeyboardButton(text="🔄 Qayta yuborish", callback_data="phone:retry")],
+    ])
 
 def location_request_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
@@ -357,8 +401,8 @@ def confirm_kb() -> InlineKeyboardMarkup:
 def admin_order_kb(oid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Qabul qilindi", callback_data=f"admin:accept:{oid}"),
-            InlineKeyboardButton(text="❌ Rad etildi",    callback_data=f"admin:reject:{oid}"),
+            InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"admin:accept:{oid}"),
+            InlineKeyboardButton(text="❌ Rad etish",    callback_data=f"admin:reject:{oid}"),
         ]
     ])
 
@@ -374,19 +418,8 @@ def courier_kb(oid: str) -> InlineKeyboardMarkup:
 # ══════════════════════════════════════════
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp  = Dispatcher(storage=MemoryStorage())
-active_orders: dict[str, dict] = {}
 
-# ──────────────────────────────────────────
-# ISH VAQTI TEKSHIRUVI — middleware sifatida ishlaydi.
-# Bu yondashuv muhim: aiogram'da filtrsiz @dp.message() handler birinchi
-# ishlaydi va keyingi handlerlarga yo'l qoldirmaydi. Shuning uchun ish vaqti
-# tekshiruvini "outer middleware" qilib yozamiz — u har bir update'dan oldin
-# ishlaydi, lekin boshqa handlerlarni (masalan rasm qabul qilish) to'smaydi.
-# Adminlarga cheklov qo'yilmaydi, ular istalgan vaqt botdan foydalansin.
-# ──────────────────────────────────────────
-from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject
-from typing import Callable, Awaitable, Any
+MAIN_MENU_TEXTS = {"🍽️ Menyu", "🛒 Savatcha", "📍 Buyurtmam", "📞 Aloqa", "🔄 Filialni almashtirish"}
 
 class WorkingHoursMiddleware(BaseMiddleware):
     async def __call__(
@@ -407,7 +440,7 @@ class WorkingHoursMiddleware(BaseMiddleware):
                 await event.answer("😴 Hozir ish vaqtimiz tugagan. 09:00–02:00 oralig'ida kuting.", show_alert=True)
             if state:
                 await state.clear()
-            return  # handlerga yuborilmaydi — bot "yopiq" deb javob berdi
+            return
 
         return await handler(event, data)
 
@@ -473,8 +506,6 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
 
     image_id = CATEGORY_IMAGES.get(cat)
     if image_id:
-        # Rasmli xabar — eski xabarni o'chirib, yangi rasm+tugma xabar yuboramiz
-        # (rasmli xabarni "edit_text" qila olmaymiz, shuning uchun yangi yuboramiz)
         try:
             await cb.message.delete()
         except Exception:
@@ -499,17 +530,21 @@ async def add_item(cb: CallbackQuery, state: FSMContext):
     cart[name] = cart.get(name, 0) + 1
     await state.update_data(cart=cart)
 
-    # Tasdiq sifatida — shu taomdan savatda nechta bor, ko'rsatamiz
     qty = cart[name]
     await cb.answer(f"✅ {name} qo'shildi! Savatchada: {qty} ta")
 
-    # Tugmalar ro'yxatini ham yangilaymiz — har bir taom yonida hozirgi soni ko'rinsin
+    # Taom ro'yxatini yangilab, pastiga 3 tugmani ko'rsatamiz
     cat = data.get("current_category")
-    if cat:
-        try:
-            await cb.message.edit_reply_markup(reply_markup=items_kb(cat, cart))
-        except Exception:
-            pass  # agar o'zgarish bo'lmasa Telegram xato qaytaradi — e'tiborsiz qoldiramiz
+    text = f"🛒 <b>Savatchangiz:</b>\n\n{cart_text(cart)}"
+    try:
+        if cat:
+            await cb.message.edit_text(
+                f"<b>{cat}</b>\n\nTaom tanlang (bossangiz darhol savatga tushadi):",
+                reply_markup=items_kb(cat, cart)
+            )
+        await cb.message.answer(text, reply_markup=after_add_kb())
+    except Exception:
+        pass
 
 @dp.callback_query(F.data == "back:categories")
 async def back_categories(cb: CallbackQuery, state: FSMContext):
@@ -517,7 +552,6 @@ async def back_categories(cb: CallbackQuery, state: FSMContext):
     try:
         await cb.message.edit_text("Kategoriyani tanlang 👇", reply_markup=categories_kb())
     except Exception:
-        # Oldingi xabar rasmli bo'lsa, edit_text ishlamaydi — yangi xabar yuboramiz
         try:
             await cb.message.delete()
         except Exception:
@@ -533,7 +567,7 @@ async def show_cart(msg: Message, state: FSMContext):
         return
     cart = data.get("cart", {})
     await msg.answer(
-        f"🛒 <b>Savatchingiz:</b>\n\n{cart_text(cart)}",
+        f"🛒 <b>Savatchangiz:</b>\n\n{cart_text(cart)}",
         reply_markup=cart_kb() if cart else None
     )
 
@@ -555,40 +589,68 @@ async def checkout(cb: CallbackQuery, state: FSMContext):
     if not data.get("cart"):
         await cb.answer("Savatcha bo'sh!", show_alert=True)
         return
-    await state.set_state(OrderState.entering_name)
-    await cb.message.answer("👤 Ism Familiyangizni kiriting:")
-    await cb.answer()
-
-@dp.message(OrderState.entering_name)
-async def enter_name(msg: Message, state: FSMContext):
-    await state.update_data(client_name=msg.text)
     await state.set_state(OrderState.entering_phone)
-    await msg.answer(
+    await cb.message.answer(
         "📞 Telefon raqamingizni tasdiqlash uchun pastdagi tugmani bosing:",
         reply_markup=phone_request_kb()
     )
+    await cb.answer()
 
+# ──────────────────────────────────────────
+# TELEFON: kontakt qabul qilish → tasdiqlash bosqichi
+# ──────────────────────────────────────────
 @dp.message(OrderState.entering_phone, F.contact)
 async def enter_phone_contact(msg: Message, state: FSMContext):
     phone = msg.contact.phone_number
     if not phone.startswith("+"):
         phone = "+" + phone
-    await state.update_data(client_phone=phone)
-    await state.set_state(OrderState.entering_location)
+    await state.update_data(pending_phone=phone)
+    await state.set_state(OrderState.confirming_phone)
     await msg.answer(
-        "✅ Raqam qabul qilindi!\n\n"
-        "📍 Endi joylashuvingizni yuboring (xaritadan aniq nuqtani tanlash mumkin):",
-        reply_markup=location_request_kb()
+        f"📞 Siz yubordingiz: <b>{phone}</b>\n\nShu raqam to'g'rimi?",
+        reply_markup=phone_confirm_kb()
     )
+
+@dp.message(OrderState.entering_phone, F.text.in_(MAIN_MENU_TEXTS))
+async def enter_phone_menu_interrupt(msg: Message, state: FSMContext):
+    # Foydalanuvchi checkout jarayonida asosiy menyu tugmasini bosdi —
+    # checkout holatini tozalab, oddiy tugma ishlovchisiga yo'naltiramiz
+    await state.set_state(None)
+    await _route_main_menu_text(msg, state)
 
 @dp.message(OrderState.entering_phone)
 async def enter_phone_invalid(msg: Message):
-    # Faqat kontakt tugmasi orqali qabul qilinadi — matn yuborilsa eslatamiz
     await msg.answer(
         "⚠️ Iltimos, raqamni faqat <b>\"📱 Raqamni ulashish\"</b> tugmasi orqali yuboring.",
         reply_markup=phone_request_kb()
     )
 
+@dp.callback_query(OrderState.confirming_phone, F.data == "phone:yes")
+async def phone_confirmed(cb: CallbackQuery, state: FSMContext):
+    data  = await state.get_data()
+    phone = data.get("pending_phone")
+    await state.update_data(client_phone=phone)
+    await state.set_state(OrderState.entering_location)
+    await cb.message.edit_text("✅ Raqam tasdiqlandi!")
+    await cb.message.answer(
+        "📍 Endi joylashuvingizni yuboring (xaritadan aniq nuqtani tanlash mumkin):",
+        reply_markup=location_request_kb()
+    )
+    await cb.answer()
+
+@dp.callback_query(OrderState.confirming_phone, F.data == "phone:retry")
+async def phone_retry(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(OrderState.entering_phone)
+    await cb.message.edit_text("🔄 Qaytadan urinib ko'ring.")
+    await cb.message.answer(
+        "📞 Telefon raqamingizni tasdiqlash uchun pastdagi tugmani bosing:",
+        reply_markup=phone_request_kb()
+    )
+    await cb.answer()
+
+# ──────────────────────────────────────────
+# GEOLOKATSIYA — majburiy, mustahkamlangan
+# ──────────────────────────────────────────
 @dp.message(OrderState.entering_location, F.location)
 async def enter_location(msg: Message, state: FSMContext):
     lat, lon = msg.location.latitude, msg.location.longitude
@@ -600,18 +662,36 @@ async def enter_location(msg: Message, state: FSMContext):
         reply_markup=None
     )
 
+@dp.message(OrderState.entering_location, F.text.in_(MAIN_MENU_TEXTS))
+async def enter_location_menu_interrupt(msg: Message, state: FSMContext):
+    await state.set_state(None)
+    await _route_main_menu_text(msg, state)
+
 @dp.message(OrderState.entering_location)
 async def enter_location_invalid(msg: Message):
     await msg.answer(
-        "⚠️ Iltimos, joylashuvni faqat <b>\"📍 Joylashuvni yuborish\"</b> tugmasi orqali yuboring.",
+        "⚠️ Iltimos, joylashuvni faqat <b>\"📍 Joylashuvni yuborish\"</b> tugmasi orqali yuboring.\n"
+        "Geolokatsiya buyurtmani to'g'ri yetkazib berish uchun majburiy.",
         reply_markup=location_request_kb()
     )
 
-@dp.message(OrderState.entering_address)
+# ──────────────────────────────────────────
+# MANZIL — endi boshqa tugmalar bilan to'qnashmaydi
+# ──────────────────────────────────────────
+@dp.message(OrderState.entering_address, F.text.in_(MAIN_MENU_TEXTS))
+async def enter_address_menu_interrupt(msg: Message, state: FSMContext):
+    await state.set_state(None)
+    await _route_main_menu_text(msg, state)
+
+@dp.message(OrderState.entering_address, F.text)
 async def enter_address(msg: Message, state: FSMContext):
     await state.update_data(client_address=msg.text)
     await state.set_state(OrderState.choosing_payment)
     await msg.answer("💳 To'lov usulini tanlang:", reply_markup=payment_kb())
+
+@dp.message(OrderState.entering_address)
+async def enter_address_invalid(msg: Message):
+    await msg.answer("⚠️ Iltimos, manzilni matn ko'rinishida yozing.")
 
 @dp.callback_query(F.data.startswith("pay:"))
 async def choose_payment(cb: CallbackQuery, state: FSMContext):
@@ -621,16 +701,16 @@ async def choose_payment(cb: CallbackQuery, state: FSMContext):
     data   = await state.get_data()
     cart   = data.get("cart", {})
     branch = BRANCHES[data["branch_key"]]
-    total  = sum(ALL_ITEMS[n] * q for n, q in cart.items()) + DELIVERY_PRICE
     await cb.message.edit_text(
         f"📋 <b>Buyurtma tasdig'i</b>\n\n"
         f"🏠 Filial: {branch['title']}\n"
-        f"👤 {data['client_name']}\n"
         f"📞 {data['client_phone']}\n"
         f"📍 {data['client_address']}\n"
         f"🗺 Lokatsiya: {data['client_lat']:.5f}, {data['client_lon']:.5f}\n\n"
         f"🛒 <b>Tarkib:</b>\n{cart_text(cart)}\n\n"
-        f"💳 To'lov: {PAY_LABELS[method]}\n\nTasdiqlaysizmi?",
+        f"💳 To'lov: {PAY_LABELS[method]}\n\n"
+        f"⚠️ Yetkazib berish narxi admin tasdiqlagandan keyin aniqlanadi.\n\n"
+        f"Tasdiqlaysizmi?",
         reply_markup=confirm_kb()
     )
     await cb.answer()
@@ -647,21 +727,28 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
     cart   = data.get("cart", {})
     method = data.get("payment", "cash")
     branch = BRANCHES[data["branch_key"]]
-    total  = sum(ALL_ITEMS[n] * q for n, q in cart.items()) + DELIVERY_PRICE
+    items_total = cart_items_total(cart)
+    dish_fee    = cart_dish_fee(cart)
     oid    = next_order_id()
 
     active_orders[oid] = {
-        "client_id": cb.from_user.id, "client_name": data["client_name"],
-        "phone": data["client_phone"], "address": data["client_address"],
+        "client_id": cb.from_user.id,
+        "phone": data["client_phone"],
+        "address": data["client_address"],
         "lat": data.get("client_lat"), "lon": data.get("client_lon"),
         "branch_key": data["branch_key"],
-        "cart": cart, "payment": method, "total": total, "status": "new",
+        "cart": cart, "payment": method,
+        "items_total": items_total, "dish_fee": dish_fee,
+        "delivery_price": None,   # admin keyinroq kiritadi
+        "total": None,            # delivery kiritilgandan keyin to'liq summa
+        "status": "new",
     }
+    save_data()
 
     await cb.message.edit_text(
         f"✅ <b>Buyurtmangiz qabul qilindi!</b>\n\n"
         f"🔖 Raqam: <b>#{oid}</b>\n"
-        f"⏳ Admin tomonidan tasdiqlanishi kutilmoqda.\n\n"
+        f"⏳ Admin tomonidan tasdiqlanishi va yetkazib berish narxi belgilanishi kutilmoqda.\n\n"
         f"Holatni bilish: /status_{oid}"
     )
     await cb.message.answer("Asosiy menyu 👇", reply_markup=main_kb())
@@ -670,10 +757,13 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
     notify = (
         f"🔔 <b>YANGI BUYURTMA #{oid}</b>\n\n"
         f"🏠 Filial: <b>{branch['title']}</b>\n"
-        f"👤 {data['client_name']} · {data['client_phone']}\n"
+        f"📞 {data['client_phone']}\n"
         f"📍 {data['client_address']}\n\n"
         f"📦 Tarkib:\n{items_str}\n\n"
-        f"💳 {PAY_LABELS[method]}\n💰 Jami: {fmt(total)}"
+        f"🍽️ Idish puli: {fmt(dish_fee)}\n"
+        f"💳 {PAY_LABELS[method]}\n"
+        f"💰 Taomlar jami: {fmt(items_total + dish_fee)}\n"
+        f"🚚 Yetkazib berish narxini kiriting: <code>/delivery_{oid} 15000</code>"
     )
     lat, lon = data.get("client_lat"), data.get("client_lon")
     for admin_id in ADMIN_IDS:
@@ -686,6 +776,39 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await cb.answer()
+
+# ──────────────────────────────────────────
+# ADMIN: yetkazib berish narxini kiritish
+# Format: /delivery_SHX-001 15000
+# ──────────────────────────────────────────
+@dp.message(F.text.regexp(r"^/delivery_(\S+)\s+(\d+)$"))
+async def admin_set_delivery(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    import re
+    m = re.match(r"^/delivery_(\S+)\s+(\d+)$", msg.text)
+    oid, price_str = m.group(1), m.group(2)
+    order = active_orders.get(oid)
+    if not order:
+        await msg.answer("❌ Bunday buyurtma topilmadi.")
+        return
+    price = int(price_str)
+    order["delivery_price"] = price
+    order["total"] = order["items_total"] + order["dish_fee"] + price
+    save_data()
+    await msg.answer(
+        f"✅ #{oid} uchun yetkazib berish narxi: {fmt(price)}\n"
+        f"💰 Yakuniy summa: {fmt(order['total'])}\n\n"
+        f"Endi buyurtmani qabul qilishingiz mumkin."
+    )
+    try:
+        await bot.send_message(
+            order["client_id"],
+            f"🚚 <b>#{oid}</b> uchun yetkazib berish narxi: {fmt(price)}\n"
+            f"💰 <b>Yakuniy summa: {fmt(order['total'])}</b>"
+        )
+    except Exception as e:
+        logging.warning(f"Mijozga yetkazib berish narxi yuborilmadi: {e}")
 
 # ──────────────────────────────────────────
 # ADMIN: Qabul qilindi / Rad etildi
@@ -706,11 +829,19 @@ async def admin_action(cb: CallbackQuery):
         await cb.answer("Bu buyurtma allaqachon ko'rib chiqilgan.", show_alert=True)
         return
 
+    if action == "accept" and order.get("delivery_price") is None:
+        await cb.answer(
+            f"⚠️ Avval yetkazib berish narxini kiriting:\n/delivery_{oid} 15000",
+            show_alert=True
+        )
+        return
+
     admin_name = cb.from_user.full_name
     branch = BRANCHES[order["branch_key"]]
 
     if action == "accept":
         order["status"] = "accept"
+        save_data()
         await cb.answer("✅ Qabul qilindi")
         status_line = f"✅ <b>Qabul qilindi</b> — {admin_name}"
         client_text = (
@@ -721,7 +852,7 @@ async def admin_action(cb: CallbackQuery):
             await bot.send_message(COURIER_ID,
                 f"🔔 <b>Yangi buyurtma #{oid}</b> admin tomonidan tasdiqlandi.\n\n"
                 f"🏠 {branch['title']}\n"
-                f"👤 {order['client_name']} · {order['phone']}\n"
+                f"📞 {order['phone']}\n"
                 f"📍 {order['address']}\n💰 {fmt(order['total'])}",
                 reply_markup=courier_kb(oid))
             if order.get("lat") is not None and order.get("lon") is not None:
@@ -730,6 +861,7 @@ async def admin_action(cb: CallbackQuery):
             logging.warning(f"Kuryerga yuborilmadi: {e}")
     else:
         order["status"] = "rejected"
+        save_data()
         await cb.answer("❌ Rad etildi")
         status_line = f"❌ <b>Rad etildi</b> — {admin_name}"
         client_text = (
@@ -770,6 +902,7 @@ async def courier_action(cb: CallbackQuery):
         return
     label, client_msg = COURIER_STEPS[action]
     order["status"] = action
+    save_data()
     await cb.answer(f"✅ {label}")
     try:
         await bot.send_message(order["client_id"],
@@ -796,10 +929,27 @@ async def check_status(msg: Message):
     labels = {"new": "🕐 Admin tasdig'ini kutmoqda", "accept": "🍳 Tayyorlanmoqda",
               "rejected": "❌ Rad etildi",
               "onway": "🛵 Kuryer yo'lda", "done": "✅ Yetkazildi"}
+    total_line = fmt(order["total"]) if order.get("total") is not None else "Hali aniqlanmagan (yetkazib berish narxi kutilmoqda)"
     await msg.answer(
         f"📦 <b>#{oid} holati:</b>\n\n{labels.get(order['status'],'—')}\n\n"
-        f"💰 {fmt(order['total'])}\n💳 {PAY_LABELS[order['payment']]}"
+        f"💰 {total_line}\n💳 {PAY_LABELS[order['payment']]}"
     )
+
+@dp.message(F.text == "📍 Buyurtmam")
+async def my_orders(msg: Message):
+    mine = [
+        (oid, o) for oid, o in active_orders.items()
+        if o.get("client_id") == msg.from_user.id
+    ]
+    if not mine:
+        await msg.answer("Sizda hali buyurtma yo'q.")
+        return
+    labels = {"new": "🕐 Kutilmoqda", "accept": "🍳 Tayyorlanmoqda",
+              "rejected": "❌ Rad etildi", "onway": "🛵 Yo'lda", "done": "✅ Yetkazildi"}
+    lines = [
+        f"• #{oid} — {labels.get(o['status'], '—')}" for oid, o in mine
+    ]
+    await msg.answer("📍 <b>Buyurtmalaringiz:</b>\n\n" + "\n".join(lines))
 
 @dp.message(F.text == "📞 Aloqa")
 async def contact(msg: Message):
@@ -818,16 +968,16 @@ async def admin_orders(msg: Message):
         return
     labels = {"new":"Yangi","accept":"Tayyorlanmoqda","rejected":"Rad etildi",
               "onway":"Yo'lda","done":"Yetkazildi"}
-    lines  = [
-        f"• <b>#{oid}</b> — {BRANCHES[o['branch_key']]['title']} — {o['client_name']} — {fmt(o['total'])} — {labels.get(o['status'],'—')}"
-        for oid, o in active_orders.items()
-    ]
+    lines  = []
+    for oid, o in active_orders.items():
+        total_str = fmt(o["total"]) if o.get("total") is not None else "narx kutilmoqda"
+        lines.append(
+            f"• <b>#{oid}</b> — {BRANCHES[o['branch_key']]['title']} — {total_str} — {labels.get(o['status'],'—')}"
+        )
     await msg.answer("📊 <b>Buyurtmalar:</b>\n\n" + "\n".join(lines))
 
 # ──────────────────────────────────────────
 # ADMIN YORDAMCHISI: kategoriya rasmlari uchun file_id olish
-# Admin botga rasm yuborsa (caption shart emas), bot file_id ni qaytaradi.
-# Shu ID ni CATEGORY_IMAGES lug'atiga qo'lda yozib qo'yiladi.
 # ──────────────────────────────────────────
 @dp.message(F.photo)
 async def admin_get_file_id(msg: Message):
@@ -839,11 +989,28 @@ async def admin_get_file_id(msg: Message):
         "Shu ID ni CATEGORY_IMAGES lug'atiga tegishli kategoriya nomi ostiga qo'ying."
     )
 
+# ──────────────────────────────────────────
+# Yordamchi: checkout oqimi to'xtatilganda asosiy menyu tugmalariga yo'naltirish
+# ──────────────────────────────────────────
+async def _route_main_menu_text(msg: Message, state: FSMContext):
+    text = msg.text
+    if text == "🍽️ Menyu":
+        await show_menu(msg, state)
+    elif text == "🛒 Savatcha":
+        await show_cart(msg, state)
+    elif text == "📍 Buyurtmam":
+        await my_orders(msg)
+    elif text == "📞 Aloqa":
+        await contact(msg)
+    elif text == "🔄 Filialni almashtirish":
+        await change_branch(msg, state)
+
 async def main():
     logging.info("🥟 SHOXSOMSA bot ishga tushdi!")
     logging.info(f"Adminlar: {ADMIN_IDS}")
     logging.info(f"Filiallar: {list(BRANCHES.keys())}")
     logging.info(f"Menyuda jami taom: {len(ALL_ITEMS)}")
+    logging.info(f"Data fayli: {DATA_FILE}")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
