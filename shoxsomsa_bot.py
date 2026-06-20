@@ -19,6 +19,8 @@ YANGI UPDATE (joriy):
     saqlanadi — bot qayta ishga tushganda (Railway restart/deploy) ma'lumot yo'qolmaydi
   - 🐛 Bug fix: manzil kiritish bosqichida boshqa tugma (Menyu/Savatcha/Aloqa) bosilsa
     endi noto'g'ri qabul qilinmaydi, foydalanuvchiga to'g'ri yo'naltiriladi
+  - 🔗 QR-kod deep link: /start?start=menu orqali kelganda filial tanlangandan
+    keyin to'g'ridan-to'g'ri menyu (kategoriyalar) ochiladi
 """
 
 import asyncio
@@ -36,7 +38,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -438,8 +440,12 @@ dp.callback_query.outer_middleware(WorkingHoursMiddleware())
 
 
 @dp.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext):
+async def cmd_start(msg: Message, state: FSMContext, command: CommandObject):
     await state.clear()
+
+    # QR-kod / deep link orqali kelganmi? (t.me/bot?start=menu)
+    deep_link_arg = command.args  # None yoki masalan "menu"
+
     await msg.answer(
         "🥟 <b>SHOXSOMSA</b> ga xush kelibsiz!\n\n"
         "Milliy taomlarimizdan buyurtma bering —\n"
@@ -447,6 +453,7 @@ async def cmd_start(msg: Message, state: FSMContext):
         f"⏰ Ish vaqti: {OPEN_TIME.strftime('%H:%M')} – {CLOSE_TIME.strftime('%H:%M')}\n\n"
         "Avval filialni tanlang 👇"
     )
+    await state.update_data(pending_action=deep_link_arg)
     await state.set_state(OrderState.choosing_branch)
     await msg.answer("🏠 Filialni tanlang:", reply_markup=branches_kb())
 
@@ -462,13 +469,24 @@ async def change_branch(msg: Message, state: FSMContext):
 async def choose_branch(cb: CallbackQuery, state: FSMContext):
     key = cb.data.split(":", 1)[1]
     branch = BRANCHES[key]
-    await state.update_data(branch_key=key, cart={})
-    await state.set_state(None)
+    data = await state.get_data()
+    pending_action = data.get("pending_action")
+
+    await state.update_data(branch_key=key, cart={}, pending_action=None)
     await cb.message.edit_text(
         f"✅ Siz <b>{branch['title']}</b> ni tanladingiz.\n\n"
         f"📍 {branch['address']}\n📞 {branch['phone']}"
     )
-    await cb.message.answer("Quyidagi menyudan foydalaning 👇", reply_markup=main_kb())
+
+    if pending_action == "menu":
+        # QR-kod orqali kelgan — filial tanlangach to'g'ridan-to'g'ri menyuga o'tadi
+        await cb.message.answer("Quyidagi menyudan foydalaning 👇", reply_markup=main_kb())
+        await state.set_state(OrderState.choosing_category)
+        await cb.message.answer("Kategoriyani tanlang 👇", reply_markup=categories_kb())
+    else:
+        await state.set_state(None)
+        await cb.message.answer("Quyidagi menyudan foydalaning 👇", reply_markup=main_kb())
+
     await cb.answer()
 
 
