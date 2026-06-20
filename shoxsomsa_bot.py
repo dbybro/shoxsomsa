@@ -7,10 +7,11 @@ Railway deployment uchun tayyor (env variables ishlatadi)
 YANGI UPDATE (joriy):
   - 🛒 Tezkor buyurtma: taom tugmasi bosilganda darhol savatga qo'shiladi,
     har bir bosishdan keyin 3 tugma chiqadi: Yana qo'shish / Bekor qilish / Buyurtma berish
-  - 🍽️ Har bir TANLANGAN KATEGORIYA uchun +5000 so'm "idish puli" qo'shiladi
-    (5 ta kategoriyadan tanlasa = 5 x 5000 = 25000, faqat 1 kategoriyadan tanlasa = 5000)
+  - 💰 Har bir DONAGA +6000 so'm qo'shiladi (1000 xizmat haqi + 5000 idish puli,
+    narxga singdirilgan, ko'rinmaydi alohida emas — masalan 5000 so'mlik somsa 11000 bo'ladi)
   - 👤 Ism-familiya endi SO'RALMAYDI — checkout to'g'ridan-to'g'ri telefondan boshlanadi
-  - 📞 Telefon raqami: kontakt tugmasi orqali + "Bu sizning raqamingizmi?" tasdiqlash bosqichi
+  - 📞 Telefon raqami: faqat kontakt tugmasi orqali, qo'shimcha tasdiqlash bosqichisiz
+    (kontakt yuborilgan zahoti to'g'ridan-to'g'ri geolokatsiyaga o'tadi)
   - 📍 Geolokatsiya: majburiy, mustahkamlangan (boshqa narsa yuborilsa eslatma beradi)
   - 🚚 Yetkazib berish narxi: ENDI BUYURTMADA YO'Q — admin buyurtmani qabul qilganda
     qo'lda kiritadi, shundan keyin mijozga yakuniy summa yuboriladi
@@ -59,8 +60,8 @@ if not ADMIN_IDS:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Har bir TANLANGAN KATEGORIYA uchun bir martalik "idish puli"
-DISH_FEE_PER_CATEGORY = 5_000
+# Har bir DONAGA qo'shiladigan summa (1000 xizmat haqi + 5000 idish puli = 6000)
+SERVICE_FEE_PER_ITEM = 6_000
 
 # ──────────────────────────────────────────
 # ISH VAQTI — 09:00 dan 02:00 gacha (Toshkent vaqti, kunni kesib o'tadi)
@@ -243,16 +244,14 @@ RAW_MENU = {
     },
 }
 
-MENU: dict[str, dict[str, int]] = RAW_MENU
+MENU: dict[str, dict[str, int]] = {
+    cat: {name: price + SERVICE_FEE_PER_ITEM for name, price in items.items()}
+    for cat, items in RAW_MENU.items()
+}
 
 ALL_ITEMS: dict[str, int] = {}
-# Har bir taom nomidan qaysi kategoriyaga tegishli ekanini bilish kerak
-# (idish puli kategoriya bo'yicha hisoblanadi)
-ITEM_CATEGORY: dict[str, str] = {}
-for _cat, _items in MENU.items():
-    ALL_ITEMS.update(_items)
-    for _name in _items:
-        ITEM_CATEGORY[_name] = _cat
+for _cat in MENU.values():
+    ALL_ITEMS.update(_cat)
 
 CATEGORY_IMAGES: dict[str, str] = {
     # "🫕 Sho'rvalar": "AgACAgI...",
@@ -270,7 +269,6 @@ class OrderState(StatesGroup):
     choosing_category  = State()
     choosing_item      = State()
     entering_phone     = State()
-    confirming_phone   = State()
     entering_location   = State()
     entering_address    = State()
     choosing_payment    = State()
@@ -290,15 +288,6 @@ def next_order_id() -> str:
 def fmt(n: int) -> str:
     return f"{n:,} so'm".replace(",", " ")
 
-def cart_categories(cart: dict) -> set[str]:
-    return {ITEM_CATEGORY[name] for name in cart if name in ITEM_CATEGORY}
-
-def cart_items_total(cart: dict) -> int:
-    return sum(ALL_ITEMS[n] * q for n, q in cart.items())
-
-def cart_dish_fee(cart: dict) -> int:
-    return len(cart_categories(cart)) * DISH_FEE_PER_CATEGORY
-
 def cart_text(cart: dict) -> str:
     if not cart:
         return "Savatcha bo'sh"
@@ -308,15 +297,12 @@ def cart_text(cart: dict) -> str:
         sub   = price * qty
         total += sub
         lines.append(f"• {name} × {qty} = {fmt(sub)}")
-    dish_fee = cart_dish_fee(cart)
-    n_cats   = len(cart_categories(cart))
-    lines.append(f"\n🍽️ Idish puli ({n_cats} turdagi taom): {fmt(dish_fee)}")
-    lines.append(f"💰 <b>Taomlar jami: {fmt(total + dish_fee)}</b>")
+    lines.append(f"\n💰 <b>Taomlar jami: {fmt(total)}</b>")
     lines.append("🚚 Yetkazib berish narxi admin tomonidan tasdiqlangach aytiladi.")
     return "\n".join(lines)
 
 def cart_grand_total(cart: dict) -> int:
-    return cart_items_total(cart) + cart_dish_fee(cart)
+    return sum(ALL_ITEMS[n] * q for n, q in cart.items())
 
 PAY_LABELS = {
     "cash": "💵 Naqd pul", "card": "💳 Karta",
@@ -372,12 +358,6 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📱 Raqamni ulashish", request_contact=True)],
     ], resize_keyboard=True, one_time_keyboard=True)
-
-def phone_confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha, to'g'ri", callback_data="phone:yes")],
-        [InlineKeyboardButton(text="🔄 Qayta yuborish", callback_data="phone:retry")],
-    ])
 
 def location_request_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
@@ -597,18 +577,19 @@ async def checkout(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 # ──────────────────────────────────────────
-# TELEFON: kontakt qabul qilish → tasdiqlash bosqichi
+# TELEFON: kontakt qabul qilish → to'g'ridan-to'g'ri geolokatsiyaga o'tish
 # ──────────────────────────────────────────
 @dp.message(OrderState.entering_phone, F.contact)
 async def enter_phone_contact(msg: Message, state: FSMContext):
     phone = msg.contact.phone_number
     if not phone.startswith("+"):
         phone = "+" + phone
-    await state.update_data(pending_phone=phone)
-    await state.set_state(OrderState.confirming_phone)
+    await state.update_data(client_phone=phone)
+    await state.set_state(OrderState.entering_location)
     await msg.answer(
-        f"📞 Siz yubordingiz: <b>{phone}</b>\n\nShu raqam to'g'rimi?",
-        reply_markup=phone_confirm_kb()
+        "✅ Raqam qabul qilindi!\n\n"
+        "📍 Endi joylashuvingizni yuboring (xaritadan aniq nuqtani tanlash mumkin):",
+        reply_markup=location_request_kb()
     )
 
 @dp.message(OrderState.entering_phone, F.text.in_(MAIN_MENU_TEXTS))
@@ -624,29 +605,6 @@ async def enter_phone_invalid(msg: Message):
         "⚠️ Iltimos, raqamni faqat <b>\"📱 Raqamni ulashish\"</b> tugmasi orqali yuboring.",
         reply_markup=phone_request_kb()
     )
-
-@dp.callback_query(OrderState.confirming_phone, F.data == "phone:yes")
-async def phone_confirmed(cb: CallbackQuery, state: FSMContext):
-    data  = await state.get_data()
-    phone = data.get("pending_phone")
-    await state.update_data(client_phone=phone)
-    await state.set_state(OrderState.entering_location)
-    await cb.message.edit_text("✅ Raqam tasdiqlandi!")
-    await cb.message.answer(
-        "📍 Endi joylashuvingizni yuboring (xaritadan aniq nuqtani tanlash mumkin):",
-        reply_markup=location_request_kb()
-    )
-    await cb.answer()
-
-@dp.callback_query(OrderState.confirming_phone, F.data == "phone:retry")
-async def phone_retry(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(OrderState.entering_phone)
-    await cb.message.edit_text("🔄 Qaytadan urinib ko'ring.")
-    await cb.message.answer(
-        "📞 Telefon raqamingizni tasdiqlash uchun pastdagi tugmani bosing:",
-        reply_markup=phone_request_kb()
-    )
-    await cb.answer()
 
 # ──────────────────────────────────────────
 # GEOLOKATSIYA — majburiy, mustahkamlangan
@@ -727,8 +685,7 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
     cart   = data.get("cart", {})
     method = data.get("payment", "cash")
     branch = BRANCHES[data["branch_key"]]
-    items_total = cart_items_total(cart)
-    dish_fee    = cart_dish_fee(cart)
+    items_total = cart_grand_total(cart)
     oid    = next_order_id()
 
     active_orders[oid] = {
@@ -738,7 +695,7 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
         "lat": data.get("client_lat"), "lon": data.get("client_lon"),
         "branch_key": data["branch_key"],
         "cart": cart, "payment": method,
-        "items_total": items_total, "dish_fee": dish_fee,
+        "items_total": items_total,
         "delivery_price": None,   # admin keyinroq kiritadi
         "total": None,            # delivery kiritilgandan keyin to'liq summa
         "status": "new",
@@ -760,9 +717,8 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
         f"📞 {data['client_phone']}\n"
         f"📍 {data['client_address']}\n\n"
         f"📦 Tarkib:\n{items_str}\n\n"
-        f"🍽️ Idish puli: {fmt(dish_fee)}\n"
         f"💳 {PAY_LABELS[method]}\n"
-        f"💰 Taomlar jami: {fmt(items_total + dish_fee)}\n"
+        f"💰 Taomlar jami: {fmt(items_total)}\n"
         f"🚚 Yetkazib berish narxini kiriting: <code>/delivery_{oid} 15000</code>"
     )
     lat, lon = data.get("client_lat"), data.get("client_lon")
@@ -794,7 +750,7 @@ async def admin_set_delivery(msg: Message):
         return
     price = int(price_str)
     order["delivery_price"] = price
-    order["total"] = order["items_total"] + order["dish_fee"] + price
+    order["total"] = order["items_total"] + price
     save_data()
     await msg.answer(
         f"✅ #{oid} uchun yetkazib berish narxi: {fmt(price)}\n"
