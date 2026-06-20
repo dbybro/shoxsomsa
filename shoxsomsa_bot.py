@@ -4,7 +4,11 @@
 SHOXSOMSA — Milliy Taomlar Telegram Bot
 Railway deployment uchun tayyor (env variables ishlatadi)
 
-Yangiliklar:
+Yangiliklar (oxirgi update):
+  - 📱 Telefon raqami FAQAT "Kontakt ulashish" tugmasi orqali (majburiy, xato bo'lmaydi)
+  - 📍 Geolokatsiya SO'RALADI + matn manzil ham so'raladi (ikkisi ham saqlanadi)
+  - 🛒 Savatga taom qo'shilganda endi shu taomdan nechta dona borligi ko'rsatiladi
+  - 🛒 Taom tugmalarida hozir savatda nechta dona borligi ko'rinadi
   - 2 filial (Axsikent, Jasmin) — har biri o'z manzil/telefoni bilan
   - To'liq menyu (93 taom, 5 kategoriya)
   - Har bir dona uchun avtomatik +1000 so'm (narxga singdirilgan, ko'rinmaydi)
@@ -243,8 +247,9 @@ class OrderState(StatesGroup):
     choosing_category = State()
     choosing_item     = State()
     entering_name     = State()
-    entering_phone    = State()
-    entering_address  = State()
+    entering_phone    = State()    # kontakt tugmasi orqali kutilmoqda
+    entering_location = State()    # geolokatsiya kutilmoqda
+    entering_address  = State()    # matn manzil kutilmoqda
     choosing_payment  = State()
     confirming        = State()
 
@@ -276,6 +281,9 @@ def cart_text(cart: dict) -> str:
     ]
     return "\n".join(lines)
 
+def cart_total_qty(cart: dict) -> int:
+    return sum(cart.values())
+
 PAY_LABELS = {
     "cash": "💵 Naqd pul", "card": "💳 Karta",
     "payme": "📱 Payme",   "click": "⚡ Click",
@@ -303,11 +311,15 @@ def categories_kb() -> InlineKeyboardMarkup:
         for cat in MENU
     ])
 
-def items_kb(category: str) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"{name} — {fmt(price)}", callback_data=f"item:{name}")]
-        for name, price in MENU[category].items()
-    ]
+def items_kb(category: str, cart: dict | None = None) -> InlineKeyboardMarkup:
+    cart = cart or {}
+    rows = []
+    for name, price in MENU[category].items():
+        qty = cart.get(name, 0)
+        label = f"{name} — {fmt(price)}"
+        if qty > 0:
+            label += f"  [🛒 {qty} ta]"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"item:{name}")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back:categories")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -317,6 +329,16 @@ def cart_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗑️ Tozalash",       callback_data="cart:clear")],
         [InlineKeyboardButton(text="✅ Buyurtma berish", callback_data="cart:checkout")],
     ])
+
+def phone_request_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📱 Raqamni ulashish", request_contact=True)],
+    ], resize_keyboard=True, one_time_keyboard=True)
+
+def location_request_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📍 Joylashuvni yuborish", request_location=True)],
+    ], resize_keyboard=True, one_time_keyboard=True)
 
 def payment_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -444,6 +466,8 @@ async def show_menu(msg: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("cat:"))
 async def choose_category(cb: CallbackQuery, state: FSMContext):
     cat = cb.data.split(":", 1)[1]
+    data = await state.get_data()
+    cart = data.get("cart", {})
     await state.update_data(current_category=cat)
     await state.set_state(OrderState.choosing_item)
 
@@ -457,11 +481,14 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
             pass
         await cb.message.answer_photo(
             photo=image_id,
-            caption=f"<b>{cat}</b>\n\nTaom tanlang:",
-            reply_markup=items_kb(cat)
+            caption=f"<b>{cat}</b>\n\nTaom tanlang (bossangiz darhol savatga tushadi):",
+            reply_markup=items_kb(cat, cart)
         )
     else:
-        await cb.message.edit_text(f"<b>{cat}</b>\n\nTaom tanlang:", reply_markup=items_kb(cat))
+        await cb.message.edit_text(
+            f"<b>{cat}</b>\n\nTaom tanlang (bossangiz darhol savatga tushadi):",
+            reply_markup=items_kb(cat, cart)
+        )
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("item:"))
@@ -471,7 +498,18 @@ async def add_item(cb: CallbackQuery, state: FSMContext):
     cart = data.get("cart", {})
     cart[name] = cart.get(name, 0) + 1
     await state.update_data(cart=cart)
-    await cb.answer(f"✅ {name} qo'shildi!")
+
+    # Tasdiq sifatida — shu taomdan savatda nechta bor, ko'rsatamiz
+    qty = cart[name]
+    await cb.answer(f"✅ {name} qo'shildi! Savatchada: {qty} ta")
+
+    # Tugmalar ro'yxatini ham yangilaymiz — har bir taom yonida hozirgi soni ko'rinsin
+    cat = data.get("current_category")
+    if cat:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=items_kb(cat, cart))
+        except Exception:
+            pass  # agar o'zgarish bo'lmasa Telegram xato qaytaradi — e'tiborsiz qoldiramiz
 
 @dp.callback_query(F.data == "back:categories")
 async def back_categories(cb: CallbackQuery, state: FSMContext):
@@ -525,13 +563,49 @@ async def checkout(cb: CallbackQuery, state: FSMContext):
 async def enter_name(msg: Message, state: FSMContext):
     await state.update_data(client_name=msg.text)
     await state.set_state(OrderState.entering_phone)
-    await msg.answer("📞 Telefon raqamingiz:\nMasalan: +998901234567")
+    await msg.answer(
+        "📞 Telefon raqamingizni tasdiqlash uchun pastdagi tugmani bosing:",
+        reply_markup=phone_request_kb()
+    )
+
+@dp.message(OrderState.entering_phone, F.contact)
+async def enter_phone_contact(msg: Message, state: FSMContext):
+    phone = msg.contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    await state.update_data(client_phone=phone)
+    await state.set_state(OrderState.entering_location)
+    await msg.answer(
+        "✅ Raqam qabul qilindi!\n\n"
+        "📍 Endi joylashuvingizni yuboring (xaritadan aniq nuqtani tanlash mumkin):",
+        reply_markup=location_request_kb()
+    )
 
 @dp.message(OrderState.entering_phone)
-async def enter_phone(msg: Message, state: FSMContext):
-    await state.update_data(client_phone=msg.text)
+async def enter_phone_invalid(msg: Message):
+    # Faqat kontakt tugmasi orqali qabul qilinadi — matn yuborilsa eslatamiz
+    await msg.answer(
+        "⚠️ Iltimos, raqamni faqat <b>\"📱 Raqamni ulashish\"</b> tugmasi orqali yuboring.",
+        reply_markup=phone_request_kb()
+    )
+
+@dp.message(OrderState.entering_location, F.location)
+async def enter_location(msg: Message, state: FSMContext):
+    lat, lon = msg.location.latitude, msg.location.longitude
+    await state.update_data(client_lat=lat, client_lon=lon)
     await state.set_state(OrderState.entering_address)
-    await msg.answer("📍 Yetkazib berish manzili:")
+    await msg.answer(
+        "✅ Joylashuv qabul qilindi!\n\n"
+        "📝 Endi aniqlik uchun manzilingizni yozing (mo'ljal, uy/xonadon raqami va h.k.):",
+        reply_markup=None
+    )
+
+@dp.message(OrderState.entering_location)
+async def enter_location_invalid(msg: Message):
+    await msg.answer(
+        "⚠️ Iltimos, joylashuvni faqat <b>\"📍 Joylashuvni yuborish\"</b> tugmasi orqali yuboring.",
+        reply_markup=location_request_kb()
+    )
 
 @dp.message(OrderState.entering_address)
 async def enter_address(msg: Message, state: FSMContext):
@@ -553,7 +627,8 @@ async def choose_payment(cb: CallbackQuery, state: FSMContext):
         f"🏠 Filial: {branch['title']}\n"
         f"👤 {data['client_name']}\n"
         f"📞 {data['client_phone']}\n"
-        f"📍 {data['client_address']}\n\n"
+        f"📍 {data['client_address']}\n"
+        f"🗺 Lokatsiya: {data['client_lat']:.5f}, {data['client_lon']:.5f}\n\n"
         f"🛒 <b>Tarkib:</b>\n{cart_text(cart)}\n\n"
         f"💳 To'lov: {PAY_LABELS[method]}\n\nTasdiqlaysizmi?",
         reply_markup=confirm_kb()
@@ -578,6 +653,7 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
     active_orders[oid] = {
         "client_id": cb.from_user.id, "client_name": data["client_name"],
         "phone": data["client_phone"], "address": data["client_address"],
+        "lat": data.get("client_lat"), "lon": data.get("client_lon"),
         "branch_key": data["branch_key"],
         "cart": cart, "payment": method, "total": total, "status": "new",
     }
@@ -588,6 +664,7 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
         f"⏳ Admin tomonidan tasdiqlanishi kutilmoqda.\n\n"
         f"Holatni bilish: /status_{oid}"
     )
+    await cb.message.answer("Asosiy menyu 👇", reply_markup=main_kb())
 
     items_str = "\n".join(f"• {n} × {q}" for n, q in cart.items())
     notify = (
@@ -598,9 +675,12 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
         f"📦 Tarkib:\n{items_str}\n\n"
         f"💳 {PAY_LABELS[method]}\n💰 Jami: {fmt(total)}"
     )
+    lat, lon = data.get("client_lat"), data.get("client_lon")
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, notify, reply_markup=admin_order_kb(oid))
+            if lat is not None and lon is not None:
+                await bot.send_location(admin_id, latitude=lat, longitude=lon)
         except Exception as e:
             logging.warning(f"Admin {admin_id} ga yuborilmadi: {e}")
 
@@ -644,6 +724,8 @@ async def admin_action(cb: CallbackQuery):
                 f"👤 {order['client_name']} · {order['phone']}\n"
                 f"📍 {order['address']}\n💰 {fmt(order['total'])}",
                 reply_markup=courier_kb(oid))
+            if order.get("lat") is not None and order.get("lon") is not None:
+                await bot.send_location(COURIER_ID, latitude=order["lat"], longitude=order["lon"])
         except Exception as e:
             logging.warning(f"Kuryerga yuborilmadi: {e}")
     else:
