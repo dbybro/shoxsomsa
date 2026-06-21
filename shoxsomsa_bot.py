@@ -318,13 +318,31 @@ def save_item_images() -> None:
 
 ITEM_IMAGES: dict[str, str] = load_item_images()
 
-CATEGORY_IMAGES: dict[str, str] = {
-    # "🫕 Sho'rvalar": "AgACAgI...",
-    # "🥟 Somsalar": "AgACAgI...",
-    # "🍣 Sushi rollar": "AgACAgI...",
-    # "🥗 Salatlar": "AgACAgI...",
-    # "🍖 Asosiy taomlar": "AgACAgI...",
-}
+# ══════════════════════════════════════════
+#  KATEGORIYA BANNERLARI — har bir kategoriya uchun bir nechta rasm bo'lishi mumkin
+#  (masalan to'liq menyu posteri), /data/category_images.json'ga saqlanadi
+#  Kalit: kategoriya nomi, qiymat: file_id lar ro'yxati
+# ══════════════════════════════════════════
+CATEGORY_IMAGES_FILE = DATA_DIR / "category_images.json"
+
+def load_category_images() -> dict[str, list[str]]:
+    if CATEGORY_IMAGES_FILE.exists():
+        try:
+            return json.loads(CATEGORY_IMAGES_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            logging.warning(f"Kategoriya bannerlari faylini o'qishda xato: {e}")
+    return {}
+
+def save_category_images() -> None:
+    try:
+        CATEGORY_IMAGES_FILE.write_text(
+            json.dumps(CATEGORY_IMAGES, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        logging.warning(f"Kategoriya bannerlari faylini saqlashda xato: {e}")
+
+CATEGORY_IMAGES: dict[str, list[str]] = load_category_images()
 
 # ══════════════════════════════════════════
 #  HOLATLAR
@@ -347,6 +365,7 @@ class AdminMenuState(StatesGroup):
     adding_item_price     = State()
     adding_category_name  = State()
     awaiting_item_image   = State()
+    awaiting_category_banner = State()
 
 class AdminOrderState(StatesGroup):
     entering_delivery_price = State()
@@ -588,6 +607,13 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
         await cb.message.delete()
     except Exception:
         pass
+
+    # Kategoriya banneri (admin panel orqali yuklangan bo'lsa, bir nechta bo'lishi mumkin)
+    for banner_id in CATEGORY_IMAGES.get(cat, []):
+        try:
+            await cb.message.answer_photo(photo=banner_id)
+        except Exception as e:
+            logging.warning(f"Kategoriya bannerini yuborishda xato ({cat}): {e}")
 
     await cb.message.answer(
         f"<b>{cat}</b>\n\nTaomlardan birini tanlang — bosganingizda darhol savatga tushadi 👇"
@@ -1136,7 +1162,23 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="adminpanel:orders")],
         [InlineKeyboardButton(text="🍽 Menyu boshqaruvi", callback_data="adminpanel:menu")],
+        [InlineKeyboardButton(text="🖼 Banner rasmlar", callback_data="adminpanel:banners")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="adminpanel:stats")],
+    ])
+
+def admin_banner_categories_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i, cat in enumerate(RAW_MENU.keys()):
+        count = len(CATEGORY_IMAGES.get(cat, []))
+        rows.append([InlineKeyboardButton(text=f"{cat} ({count} ta)", callback_data=f"banncat:{i}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Admin panelga", callback_data="adminpanel:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def admin_banner_detail_kb(cat_idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Banner qo'shish", callback_data=f"bannadd:{cat_idx}")],
+        [InlineKeyboardButton(text="🗑 Hammasini tozalash", callback_data=f"bannclear:{cat_idx}")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adminpanel:banners")],
     ])
 
 def back_to_panel_kb() -> InlineKeyboardMarkup:
@@ -1227,6 +1269,81 @@ async def admin_panel_menu(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminMenuState.choosing_category)
     await cb.message.edit_text("🍽 <b>Menyu boshqaruvi</b>\n\nKategoriyani tanlang:", reply_markup=admin_menu_categories_kb())
     await cb.answer()
+
+# ──────────────────────────────────────────
+# ADMIN: kategoriya bannerlari (kategoriya ochilganda yuqorida chiqadigan rasm/posterlar)
+# ──────────────────────────────────────────
+@dp.callback_query(F.data == "adminpanel:banners")
+async def admin_panel_banners(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.clear()
+    await cb.message.edit_text("🖼 <b>Kategoriya bannerlari</b>\n\nQaysi kategoriyaga banner qo'shamiz?", reply_markup=admin_banner_categories_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("banncat:"))
+async def admin_banner_show(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    cat_idx = int(cb.data.split(":")[1])
+    cat = list(RAW_MENU.keys())[cat_idx]
+    count = len(CATEGORY_IMAGES.get(cat, []))
+    await cb.message.edit_text(
+        f"🖼 <b>{cat}</b>\n\nHozirgi bannerlar soni: {count}",
+        reply_markup=admin_banner_detail_kb(cat_idx)
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("bannadd:"))
+async def admin_banner_add_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    cat_idx = int(cb.data.split(":")[1])
+    cat = list(RAW_MENU.keys())[cat_idx]
+    await state.update_data(bann_cat_idx=cat_idx)
+    await state.set_state(AdminMenuState.awaiting_category_banner)
+    await cb.message.edit_text(f"🖼 <b>{cat}</b> uchun banner rasm yuboring (oddiy foto sifatida):")
+    await cb.answer()
+
+@dp.message(AdminMenuState.awaiting_category_banner, F.photo)
+async def admin_banner_add_save(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    data = await state.get_data()
+    cat_idx = data["bann_cat_idx"]
+    cat = list(RAW_MENU.keys())[cat_idx]
+    CATEGORY_IMAGES.setdefault(cat, []).append(msg.photo[-1].file_id)
+    save_category_images()
+    count = len(CATEGORY_IMAGES[cat])
+    await msg.answer(
+        f"✅ Banner qo'shildi. <b>{cat}</b> uchun jami: {count} ta.\n\n"
+        f"Yana qo'shish uchun ➕ tugmasini bosing yoki orqaga qayting.",
+        reply_markup=admin_banner_detail_kb(cat_idx)
+    )
+
+@dp.message(AdminMenuState.awaiting_category_banner)
+async def admin_banner_add_invalid(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer("⚠️ Iltimos, rasmni oddiy foto sifatida yuboring, fayl/dokument emas.")
+
+@dp.callback_query(F.data.startswith("bannclear:"))
+async def admin_banner_clear(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    cat_idx = int(cb.data.split(":")[1])
+    cat = list(RAW_MENU.keys())[cat_idx]
+    CATEGORY_IMAGES.pop(cat, None)
+    save_category_images()
+    await cb.answer("🗑 Tozalandi")
+    await cb.message.edit_text(
+        f"🖼 <b>{cat}</b>\n\nHozirgi bannerlar soni: 0",
+        reply_markup=admin_banner_detail_kb(cat_idx)
+    )
 
 @dp.callback_query(F.data.startswith("amcat:"))
 async def admin_menu_show_items(cb: CallbackQuery, state: FSMContext):
