@@ -615,11 +615,13 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
         except Exception as e:
             logging.warning(f"Kategoriya bannerini yuborishda xato ({cat}): {e}")
 
-    await cb.message.answer(
-        f"<b>{cat}</b>\n\nTaomlardan birini tanlang — bosganingizda darhol savatga tushadi 👇"
-    )
+    await cb.message.answer(f"<b>{cat}</b>")
 
+    # Rasmi bor taomlar — har biri alohida, rasm bilan ko'rinadi
     for name, menu_price in MENU[cat].items():
+        image_id = ITEM_IMAGES.get(name)
+        if not image_id:
+            continue
         qty = cart.get(name, 0)
         caption = f"<b>{name}</b>\n💰 {fmt(menu_price)}"
         if qty > 0:
@@ -627,21 +629,16 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
         item_kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="➕ Savatga qo'shish", callback_data=f"item:{name}")
         ]])
-        image_id = ITEM_IMAGES.get(name)
         try:
-            if image_id:
-                await cb.message.answer_photo(photo=image_id, caption=caption, reply_markup=item_kb)
-            else:
-                await cb.message.answer(caption, reply_markup=item_kb)
+            await cb.message.answer_photo(photo=image_id, caption=caption, reply_markup=item_kb)
         except Exception as e:
-            logging.warning(f"Taom xabarini yuborishda xato ({name}): {e}")
+            logging.warning(f"Taom rasmini yuborishda xato ({name}): {e}")
             await cb.message.answer(caption, reply_markup=item_kb)
 
+    # Rasmi yo'q taomlar — barchasi bitta xabarda, ro'yxat sifatida
     await cb.message.answer(
-        "⬆️ Yuqoridagi taomlardan tanlang, yoki ortga qayting:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Kategoriyalarga qaytish", callback_data="back:categories")]
-        ])
+        "Taomlardan birini tanlang — bosganingizda darhol savatga tushadi 👇",
+        reply_markup=items_kb(cat, cart)
     )
     await cb.answer()
 
