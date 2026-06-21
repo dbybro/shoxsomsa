@@ -608,16 +608,26 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Kategoriya banneri (admin panel orqali yuklangan bo'lsa, bir nechta bo'lishi mumkin)
-    for banner_id in CATEGORY_IMAGES.get(cat, []):
+    banners = CATEGORY_IMAGES.get(cat, [])
+    header_text = f"<b>{cat}</b>\n\nTaomlardan birini tanlang — bosganingizda darhol savatga tushadi 👇"
+    combined_kb = items_kb(cat, cart)
+
+    if banners:
+        # Bir nechta banner bo'lsa — oldingilari oddiy rasm, oxirgisiga sarlavha+tugmalar biriktiriladi
+        for banner_id in banners[:-1]:
+            try:
+                await cb.message.answer_photo(photo=banner_id)
+            except Exception as e:
+                logging.warning(f"Kategoriya bannerini yuborishda xato ({cat}): {e}")
         try:
-            await cb.message.answer_photo(photo=banner_id)
+            await cb.message.answer_photo(photo=banners[-1], caption=header_text, reply_markup=combined_kb)
         except Exception as e:
             logging.warning(f"Kategoriya bannerini yuborishda xato ({cat}): {e}")
+            await cb.message.answer(header_text, reply_markup=combined_kb)
+    else:
+        await cb.message.answer(header_text, reply_markup=combined_kb)
 
-    await cb.message.answer(f"<b>{cat}</b>")
-
-    # Rasmi bor taomlar — har biri alohida, rasm bilan ko'rinadi
+    # Rasmi bor taomlar (agar mavjud bo'lsa) — har biri alohida karta sifatida, asosiy posttdan keyin
     for name, menu_price in MENU[cat].items():
         image_id = ITEM_IMAGES.get(name)
         if not image_id:
@@ -635,11 +645,6 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
             logging.warning(f"Taom rasmini yuborishda xato ({name}): {e}")
             await cb.message.answer(caption, reply_markup=item_kb)
 
-    # Rasmi yo'q taomlar — barchasi bitta xabarda, ro'yxat sifatida
-    await cb.message.answer(
-        "Taomlardan birini tanlang — bosganingizda darhol savatga tushadi 👇",
-        reply_markup=items_kb(cat, cart)
-    )
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("item:"))
