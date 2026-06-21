@@ -93,6 +93,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s �
 # ══════════════════════════════════════════
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "."))
 DATA_FILE = DATA_DIR / "bot_data.json"
+MENU_FILE = DATA_DIR / "menu_data.json"
 
 def load_data() -> tuple[dict, int]:
     if DATA_FILE.exists():
@@ -135,7 +136,7 @@ BRANCHES = {
 #  MENYU — narxlar (idish puli endi kategoriya darajasida qo'shiladi,
 #  shuning uchun MENU = RAW_MENU, har bir taom narxi o'zgarmaydi)
 # ══════════════════════════════════════════
-RAW_MENU = {
+DEFAULT_RAW_MENU = {
     "🫕 Sho'rvalar": {
         "Mastava": 35_000,
         "Mol go'shtida sho'rva": 50_000,
@@ -248,17 +249,74 @@ RAW_MENU = {
     },
 }
 
-# MENU = menyuda ko'rinadigan narx (asl narx + mening haqqim)
-MENU: dict[str, dict[str, int]] = {
-    cat: {name: price + SERVICE_FEE_PER_ITEM for name, price in items.items()}
-    for cat, items in RAW_MENU.items()
-}
+# ══════════════════════════════════════════
+#  MENYU PERSISTENCE — admin panel orqali qo'shilgan/o'zgartirilgan taomlar
+#  /data/menu_data.json fayliga saqlanadi (bot qayta ishga tushganda yo'qolmaydi)
+# ══════════════════════════════════════════
+def load_menu() -> dict[str, dict[str, int]]:
+    if MENU_FILE.exists():
+        try:
+            raw = json.loads(MENU_FILE.read_text(encoding="utf-8"))
+            if raw:
+                return raw
+        except Exception as e:
+            logging.warning(f"Menyu faylini o'qishda xato: {e} — standart menyu ishlatiladi")
+    return {cat: dict(items) for cat, items in DEFAULT_RAW_MENU.items()}
 
+def save_menu() -> None:
+    try:
+        MENU_FILE.write_text(
+            json.dumps(RAW_MENU, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        logging.warning(f"Menyu faylini saqlashda xato: {e}")
+
+RAW_MENU: dict[str, dict[str, int]] = load_menu()
+
+# MENU = menyuda ko'rinadigan narx (asl narx + mening haqqim)
 # ALL_ITEMS = savatga qo'shilgandagi/checkout uchun yakuniy narx (menyu narxi + idish puli)
+MENU: dict[str, dict[str, int]] = {}
 ALL_ITEMS: dict[str, int] = {}
-for _cat in MENU.values():
-    for _name, _menu_price in _cat.items():
-        ALL_ITEMS[_name] = _menu_price + DISH_FEE_PER_ITEM
+
+def rebuild_menu_caches() -> None:
+    """RAW_MENU o'zgargandan keyin (admin panel orqali) MENU va ALL_ITEMS ni qayta hisoblaydi."""
+    global MENU, ALL_ITEMS
+    MENU = {
+        cat: {name: price + SERVICE_FEE_PER_ITEM for name, price in items.items()}
+        for cat, items in RAW_MENU.items()
+    }
+    ALL_ITEMS = {}
+    for _cat in MENU.values():
+        for _name, _menu_price in _cat.items():
+            ALL_ITEMS[_name] = _menu_price + DISH_FEE_PER_ITEM
+
+rebuild_menu_caches()
+
+# ══════════════════════════════════════════
+#  TAOM RASMLARI — har bir taom uchun (ixtiyoriy), /data/item_images.json'ga saqlanadi
+#  Kalit: taom nomi, qiymat: Telegram file_id
+# ══════════════════════════════════════════
+ITEM_IMAGES_FILE = DATA_DIR / "item_images.json"
+
+def load_item_images() -> dict[str, str]:
+    if ITEM_IMAGES_FILE.exists():
+        try:
+            return json.loads(ITEM_IMAGES_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            logging.warning(f"Taom rasmlari faylini o'qishda xato: {e}")
+    return {}
+
+def save_item_images() -> None:
+    try:
+        ITEM_IMAGES_FILE.write_text(
+            json.dumps(ITEM_IMAGES, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        logging.warning(f"Taom rasmlari faylini saqlashda xato: {e}")
+
+ITEM_IMAGES: dict[str, str] = load_item_images()
 
 CATEGORY_IMAGES: dict[str, str] = {
     # "🫕 Sho'rvalar": "AgACAgI...",
@@ -280,6 +338,18 @@ class OrderState(StatesGroup):
     entering_address    = State()
     choosing_payment    = State()
     confirming          = State()
+
+class AdminMenuState(StatesGroup):
+    choosing_category     = State()
+    choosing_item         = State()
+    editing_price         = State()
+    adding_item_name      = State()
+    adding_item_price     = State()
+    adding_category_name  = State()
+    awaiting_item_image   = State()
+
+class AdminOrderState(StatesGroup):
+    entering_delivery_price = State()
 
 # ══════════════════════════════════════════
 #  YORDAMCHILAR
@@ -346,6 +416,8 @@ def items_kb(category: str, cart: dict | None = None) -> InlineKeyboardMarkup:
     cart = cart or {}
     rows = []
     for name, menu_price in MENU[category].items():
+        if name in ITEM_IMAGES:
+            continue  # bu taom alohida surat (rasm) sifatida ko'rsatiladi
         qty = cart.get(name, 0)
         label = f"{name} — {fmt(menu_price)}"
         if qty > 0:
@@ -391,6 +463,7 @@ def confirm_kb() -> InlineKeyboardMarkup:
 
 def admin_order_kb(oid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚚 Yetkazib berish narxini kiritish", callback_data=f"admin:setdelivery:{oid}")],
         [
             InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"admin:accept:{oid}"),
             InlineKeyboardButton(text="❌ Rad etish",    callback_data=f"admin:reject:{oid}"),
@@ -511,22 +584,39 @@ async def choose_category(cb: CallbackQuery, state: FSMContext):
     await state.update_data(current_category=cat)
     await state.set_state(OrderState.choosing_item)
 
-    image_id = CATEGORY_IMAGES.get(cat)
-    if image_id:
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+    await cb.message.answer(
+        f"<b>{cat}</b>\n\nTaomlardan birini tanlang — bosganingizda darhol savatga tushadi 👇"
+    )
+
+    for name, menu_price in MENU[cat].items():
+        qty = cart.get(name, 0)
+        caption = f"<b>{name}</b>\n💰 {fmt(menu_price)}"
+        if qty > 0:
+            caption += f"\n🛒 Savatchada: {qty} ta"
+        item_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Savatga qo'shish", callback_data=f"item:{name}")
+        ]])
+        image_id = ITEM_IMAGES.get(name)
         try:
-            await cb.message.delete()
-        except Exception:
-            pass
-        await cb.message.answer_photo(
-            photo=image_id,
-            caption=f"<b>{cat}</b>\n\nTaom tanlang (bossangiz darhol savatga tushadi):",
-            reply_markup=items_kb(cat, cart)
-        )
-    else:
-        await cb.message.edit_text(
-            f"<b>{cat}</b>\n\nTaom tanlang (bossangiz darhol savatga tushadi):",
-            reply_markup=items_kb(cat, cart)
-        )
+            if image_id:
+                await cb.message.answer_photo(photo=image_id, caption=caption, reply_markup=item_kb)
+            else:
+                await cb.message.answer(caption, reply_markup=item_kb)
+        except Exception as e:
+            logging.warning(f"Taom xabarini yuborishda xato ({name}): {e}")
+            await cb.message.answer(caption, reply_markup=item_kb)
+
+    await cb.message.answer(
+        "⬆️ Yuqoridagi taomlardan tanlang, yoki ortga qayting:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Kategoriyalarga qaytish", callback_data="back:categories")]
+        ])
+    )
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("item:"))
@@ -540,15 +630,8 @@ async def add_item(cb: CallbackQuery, state: FSMContext):
     qty = cart[name]
     await cb.answer(f"✅ {name} qo'shildi! Savatchada: {qty} ta")
 
-    # Taom ro'yxatini yangilab, pastiga 3 tugmani ko'rsatamiz
-    cat = data.get("current_category")
     text = f"🛒 <b>Savatchangiz:</b>\n\n{cart_text(cart)}"
     try:
-        if cat:
-            await cb.message.edit_text(
-                f"<b>{cat}</b>\n\nTaom tanlang (bossangiz darhol savatga tushadi):",
-                reply_markup=items_kb(cat, cart)
-            )
         await cb.message.answer(text, reply_markup=after_add_kb())
     except Exception:
         pass
@@ -726,6 +809,7 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
         "delivery_price": None,   # admin keyinroq kiritadi
         "total": None,            # delivery kiritilgandan keyin to'liq summa
         "status": "new",
+        "created_at": datetime.now(TIMEZONE).isoformat(),
     }
     save_data()
 
@@ -762,28 +846,18 @@ async def order_confirm(cb: CallbackQuery, state: FSMContext):
 
 # ──────────────────────────────────────────
 # ADMIN: yetkazib berish narxini kiritish
-# Format: /delivery_SHX-001 15000
+# 1) Komanda orqali: /delivery_SHX-001 15000
+# 2) Tugma orqali: "🚚 Yetkazib berish narxini kiritish" → faqat son yuborish
 # ──────────────────────────────────────────
-@dp.message(F.text.regexp(r"^/delivery_(\S+)\s+(\d+)$"))
-async def admin_set_delivery(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    import re
-    m = re.match(r"^/delivery_(\S+)\s+(\d+)$", msg.text)
-    oid, price_str = m.group(1), m.group(2)
+async def apply_delivery_price(oid: str, price: int) -> dict | None:
+    """Buyurtmaga yetkazib berish narxini qo'yadi, yakuniy summani hisoblaydi,
+    saqlaydi va mijozga xabar yuboradi. Order topilmasa None qaytaradi."""
     order = active_orders.get(oid)
     if not order:
-        await msg.answer("❌ Bunday buyurtma topilmadi.")
-        return
-    price = int(price_str)
+        return None
     order["delivery_price"] = price
     order["total"] = order["items_total"] + price
     save_data()
-    await msg.answer(
-        f"✅ #{oid} uchun yetkazib berish narxi: {fmt(price)}\n"
-        f"💰 Yakuniy summa: {fmt(order['total'])}\n\n"
-        f"Endi buyurtmani qabul qilishingiz mumkin."
-    )
     try:
         await bot.send_message(
             order["client_id"],
@@ -792,6 +866,60 @@ async def admin_set_delivery(msg: Message):
         )
     except Exception as e:
         logging.warning(f"Mijozga yetkazib berish narxi yuborilmadi: {e}")
+    return order
+
+@dp.message(F.text.regexp(r"^/delivery_(\S+)\s+(\d+)$"))
+async def admin_set_delivery(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    import re
+    m = re.match(r"^/delivery_(\S+)\s+(\d+)$", msg.text)
+    oid, price_str = m.group(1), m.group(2)
+    order = await apply_delivery_price(oid, int(price_str))
+    if not order:
+        await msg.answer("❌ Bunday buyurtma topilmadi.")
+        return
+    await msg.answer(
+        f"✅ #{oid} uchun yetkazib berish narxi: {fmt(order['delivery_price'])}\n"
+        f"💰 Yakuniy summa: {fmt(order['total'])}\n\n"
+        f"Endi buyurtmani qabul qilishingiz mumkin.",
+        reply_markup=admin_order_kb(oid)
+    )
+
+@dp.callback_query(F.data.startswith("admin:setdelivery:"))
+async def admin_set_delivery_button_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    oid = cb.data.split(":", 2)[2]
+    if oid not in active_orders:
+        await cb.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    await state.update_data(delivery_oid=oid)
+    await state.set_state(AdminOrderState.entering_delivery_price)
+    await cb.message.answer(f"🚚 <b>#{oid}</b> uchun yetkazib berish narxini kiriting (faqat son, masalan 15000):")
+    await cb.answer()
+
+@dp.message(AdminOrderState.entering_delivery_price)
+async def admin_set_delivery_button_save(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if not msg.text or not msg.text.strip().isdigit():
+        await msg.answer("⚠️ Iltimos, faqat son kiriting (masalan 15000).")
+        return
+    data = await state.get_data()
+    oid = data.get("delivery_oid")
+    order = await apply_delivery_price(oid, int(msg.text.strip()))
+    await state.clear()
+    if not order:
+        await msg.answer("❌ Bunday buyurtma topilmadi.")
+        return
+    await msg.answer(
+        f"✅ #{oid} uchun yetkazib berish narxi: {fmt(order['delivery_price'])}\n"
+        f"💰 Yakuniy summa: {fmt(order['total'])}\n\n"
+        f"Endi buyurtmani qabul qilishingiz mumkin.",
+        reply_markup=admin_order_kb(oid)
+    )
 
 # ──────────────────────────────────────────
 # ADMIN: Qabul qilindi / Rad etildi
@@ -942,25 +1070,367 @@ async def contact(msg: Message):
     lines.append(f"⏰ {OPEN_TIME.strftime('%H:%M')} – {CLOSE_TIME.strftime('%H:%M')}")
     await msg.answer("\n".join(lines))
 
-@dp.message(Command("orders"))
-async def admin_orders(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
+def build_orders_text() -> str:
     if not active_orders:
-        await msg.answer("Hozircha buyurtma yo'q.")
-        return
+        return "📦 <b>Buyurtmalar</b>\n\nHozircha buyurtma yo'q."
     labels = {"new":"Yangi","accept":"Tayyorlanmoqda","rejected":"Rad etildi",
               "onway":"Yo'lda","done":"Yetkazildi"}
-    lines  = []
+    lines  = ["📦 <b>Buyurtmalar:</b>\n"]
     for oid, o in active_orders.items():
         total_str = fmt(o["total"]) if o.get("total") is not None else "narx kutilmoqda"
         lines.append(
             f"• <b>#{oid}</b> — {BRANCHES[o['branch_key']]['title']} — {total_str} — {labels.get(o['status'],'—')}"
         )
-    await msg.answer("📊 <b>Buyurtmalar:</b>\n\n" + "\n".join(lines))
+    return "\n".join(lines)
+
+def build_stats_text() -> str:
+    if not active_orders:
+        return "📊 <b>Statistika</b>\n\nHali buyurtmalar yo'q."
+
+    labels = {"new": "Yangi", "accept": "Tasdiqlangan", "rejected": "Rad etilgan",
+              "onway": "Yo'lda", "done": "Yetkazilgan"}
+    status_counts = {k: 0 for k in labels}
+    revenue_done = 0
+    revenue_confirmed = 0
+    item_counts: dict[str, int] = {}
+    today = datetime.now(TIMEZONE).date()
+    today_count = 0
+
+    for o in active_orders.values():
+        st = o.get("status", "new")
+        status_counts[st] = status_counts.get(st, 0) + 1
+        if st in ("accept", "onway", "done") and o.get("total") is not None:
+            revenue_confirmed += o["total"]
+        if st == "done" and o.get("total") is not None:
+            revenue_done += o["total"]
+        for name, qty in o.get("cart", {}).items():
+            item_counts[name] = item_counts.get(name, 0) + qty
+        ca = o.get("created_at")
+        if ca:
+            try:
+                if datetime.fromisoformat(ca).astimezone(TIMEZONE).date() == today:
+                    today_count += 1
+            except Exception:
+                pass
+
+    lines = ["📊 <b>Statistika</b>\n"]
+    lines.append(f"🧾 Jami buyurtmalar: {len(active_orders)}")
+    lines.append(f"📅 Bugungi buyurtmalar: {today_count}\n")
+    for st, label in labels.items():
+        lines.append(f"• {label}: {status_counts.get(st, 0)}")
+    lines.append(f"\n💰 Yetkazilgan buyurtmalar tushumi: {fmt(revenue_done)}")
+    lines.append(f"💵 Tasdiqlangan+ buyurtmalar tushumi: {fmt(revenue_confirmed)}")
+
+    if item_counts:
+        top = sorted(item_counts.items(), key=lambda x: -x[1])[:5]
+        lines.append("\n🔥 <b>Eng ko'p buyurtma qilingan taomlar:</b>")
+        for name, qty in top:
+            lines.append(f"• {name} — {qty} ta")
+
+    return "\n".join(lines)
 
 # ──────────────────────────────────────────
-# ADMIN YORDAMCHISI: kategoriya rasmlari uchun file_id olish
+# ADMIN PANEL — /admin: buyurtmalar, menyu boshqaruvi, statistika
+# ──────────────────────────────────────────
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="adminpanel:orders")],
+        [InlineKeyboardButton(text="🍽 Menyu boshqaruvi", callback_data="adminpanel:menu")],
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="adminpanel:stats")],
+    ])
+
+def back_to_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Admin panelga", callback_data="adminpanel:back")]
+    ])
+
+def admin_orders_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for oid, o in active_orders.items():
+        if o.get("status") == "new" and o.get("delivery_price") is None:
+            rows.append([InlineKeyboardButton(
+                text=f"🚚 #{oid} narxini kiritish",
+                callback_data=f"admin:setdelivery:{oid}"
+            )])
+    rows.append([InlineKeyboardButton(text="⬅️ Admin panelga", callback_data="adminpanel:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def admin_menu_categories_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=cat, callback_data=f"amcat:{i}")]
+        for i, cat in enumerate(RAW_MENU.keys())
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Yangi kategoriya", callback_data="amaddcat")])
+    rows.append([InlineKeyboardButton(text="⬅️ Admin panelga", callback_data="adminpanel:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def admin_items_kb(cat_idx: int) -> InlineKeyboardMarkup:
+    cat = list(RAW_MENU.keys())[cat_idx]
+    rows = []
+    for j, (name, price) in enumerate(RAW_MENU[cat].items()):
+        rows.append([InlineKeyboardButton(text=f"{name} — {fmt(price)}", callback_data=f"amitem:{cat_idx}:{j}")])
+    rows.append([InlineKeyboardButton(text="➕ Yangi taom qo'shish", callback_data=f"amaddit:{cat_idx}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adminpanel:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def admin_item_detail_kb(cat_idx: int, item_idx: int, has_image: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="✏️ Narxini o'zgartirish", callback_data=f"amedit:{cat_idx}:{item_idx}")],
+        [InlineKeyboardButton(
+            text="🖼 Rasmni almashtirish" if has_image else "🖼 Rasm qo'shish",
+            callback_data=f"amimg:{cat_idx}:{item_idx}"
+        )],
+    ]
+    if has_image:
+        rows.append([InlineKeyboardButton(text="🚫 Rasmni o'chirish", callback_data=f"amimgdel:{cat_idx}:{item_idx}")])
+    rows.append([InlineKeyboardButton(text="🗑 Taomni o'chirish", callback_data=f"amdel:{cat_idx}:{item_idx}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"amcat:{cat_idx}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.message(Command("admin"))
+async def admin_panel(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    await state.clear()
+    await msg.answer("🛠 <b>Admin panel</b>\n\nBo'limni tanlang:", reply_markup=admin_panel_kb())
+
+@dp.callback_query(F.data == "adminpanel:back")
+async def admin_panel_back(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.clear()
+    await cb.message.edit_text("🛠 <b>Admin panel</b>\n\nBo'limni tanlang:", reply_markup=admin_panel_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data == "adminpanel:orders")
+async def admin_panel_orders(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await cb.message.edit_text(build_orders_text(), reply_markup=admin_orders_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data == "adminpanel:stats")
+async def admin_panel_stats(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await cb.message.edit_text(build_stats_text(), reply_markup=back_to_panel_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data == "adminpanel:menu")
+async def admin_panel_menu(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.set_state(AdminMenuState.choosing_category)
+    await cb.message.edit_text("🍽 <b>Menyu boshqaruvi</b>\n\nKategoriyani tanlang:", reply_markup=admin_menu_categories_kb())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("amcat:"))
+async def admin_menu_show_items(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    cat_idx = int(cb.data.split(":")[1])
+    cat = list(RAW_MENU.keys())[cat_idx]
+    await state.set_state(AdminMenuState.choosing_item)
+    await state.update_data(am_cat_idx=cat_idx)
+    await cb.message.edit_text(f"🍽 <b>{cat}</b>\n\nTaomni tanlang:", reply_markup=admin_items_kb(cat_idx))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("amitem:"))
+async def admin_menu_item_detail(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, cat_idx_s, item_idx_s = cb.data.split(":")
+    cat_idx, item_idx = int(cat_idx_s), int(item_idx_s)
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    price = RAW_MENU[cat][name]
+    has_image = name in ITEM_IMAGES
+    image_line = "🖼 Rasm: bor ✅" if has_image else "🖼 Rasm: yo'q ❌"
+    await cb.message.edit_text(
+        f"🍽 <b>{name}</b>\n💰 Narxi: {fmt(price)}\n{image_line}\n\nNima qilamiz?",
+        reply_markup=admin_item_detail_kb(cat_idx, item_idx, has_image)
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("amimg:"))
+async def admin_menu_image_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, cat_idx_s, item_idx_s = cb.data.split(":")
+    cat_idx, item_idx = int(cat_idx_s), int(item_idx_s)
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    await state.update_data(am_cat_idx=cat_idx, am_item_idx=item_idx)
+    await state.set_state(AdminMenuState.awaiting_item_image)
+    await cb.message.edit_text(f"🖼 <b>{name}</b> uchun rasm yuboring (oddiy foto sifatida, fayl emas):")
+    await cb.answer()
+
+@dp.message(AdminMenuState.awaiting_item_image, F.photo)
+async def admin_menu_image_save(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    data = await state.get_data()
+    cat_idx, item_idx = data["am_cat_idx"], data["am_item_idx"]
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    ITEM_IMAGES[name] = msg.photo[-1].file_id
+    save_item_images()
+    await state.set_state(AdminMenuState.choosing_item)
+    await msg.answer(f"✅ <b>{name}</b> uchun rasm saqlandi.", reply_markup=admin_items_kb(cat_idx))
+
+@dp.message(AdminMenuState.awaiting_item_image)
+async def admin_menu_image_invalid(msg: Message):
+    await msg.answer("⚠️ Iltimos, rasmni oddiy foto (rasm) sifatida yuboring, fayl/dokument emas.")
+
+@dp.callback_query(F.data.startswith("amimgdel:"))
+async def admin_menu_image_delete(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, cat_idx_s, item_idx_s = cb.data.split(":")
+    cat_idx, item_idx = int(cat_idx_s), int(item_idx_s)
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    ITEM_IMAGES.pop(name, None)
+    save_item_images()
+    await cb.answer("🚫 Rasm o'chirildi")
+    await cb.message.edit_text(
+        f"🍽 <b>{name}</b>\n💰 Narxi: {fmt(RAW_MENU[cat][name])}\n🖼 Rasm: yo'q ❌\n\nNima qilamiz?",
+        reply_markup=admin_item_detail_kb(cat_idx, item_idx, False)
+    )
+
+@dp.callback_query(F.data.startswith("amedit:"))
+async def admin_menu_edit_price_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, cat_idx_s, item_idx_s = cb.data.split(":")
+    cat_idx, item_idx = int(cat_idx_s), int(item_idx_s)
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    await state.update_data(am_cat_idx=cat_idx, am_item_idx=item_idx)
+    await state.set_state(AdminMenuState.editing_price)
+    await cb.message.edit_text(f"✏️ <b>{name}</b> uchun yangi narxni kiriting (faqat son, masalan 35000):")
+    await cb.answer()
+
+@dp.message(AdminMenuState.editing_price)
+async def admin_menu_edit_price_save(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if not msg.text or not msg.text.strip().isdigit():
+        await msg.answer("⚠️ Iltimos, faqat son kiriting (masalan 35000).")
+        return
+    new_price = int(msg.text.strip())
+    data = await state.get_data()
+    cat_idx, item_idx = data["am_cat_idx"], data["am_item_idx"]
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    RAW_MENU[cat][name] = new_price
+    rebuild_menu_caches()
+    save_menu()
+    await state.set_state(AdminMenuState.choosing_item)
+    await msg.answer(f"✅ <b>{name}</b> narxi {fmt(new_price)} ga o'zgartirildi.", reply_markup=admin_items_kb(cat_idx))
+
+@dp.callback_query(F.data.startswith("amdel:"))
+async def admin_menu_delete_item(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, cat_idx_s, item_idx_s = cb.data.split(":")
+    cat_idx, item_idx = int(cat_idx_s), int(item_idx_s)
+    cat = list(RAW_MENU.keys())[cat_idx]
+    name = list(RAW_MENU[cat].keys())[item_idx]
+    del RAW_MENU[cat][name]
+    rebuild_menu_caches()
+    save_menu()
+    if name in ITEM_IMAGES:
+        del ITEM_IMAGES[name]
+        save_item_images()
+    await cb.answer(f"🗑 {name} o'chirildi")
+    await cb.message.edit_text(f"🍽 <b>{cat}</b>\n\nTaomni tanlang:", reply_markup=admin_items_kb(cat_idx))
+
+@dp.callback_query(F.data.startswith("amaddit:"))
+async def admin_menu_add_item_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    cat_idx = int(cb.data.split(":")[1])
+    await state.update_data(am_cat_idx=cat_idx)
+    await state.set_state(AdminMenuState.adding_item_name)
+    await cb.message.edit_text("➕ Yangi taom nomini kiriting:")
+    await cb.answer()
+
+@dp.message(AdminMenuState.adding_item_name)
+async def admin_menu_add_item_name(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if not msg.text or not msg.text.strip():
+        await msg.answer("⚠️ Iltimos, taom nomini matn ko'rinishida kiriting.")
+        return
+    await state.update_data(am_new_name=msg.text.strip())
+    await state.set_state(AdminMenuState.adding_item_price)
+    await msg.answer("💰 Endi narxini kiriting (faqat son, masalan 25000):")
+
+@dp.message(AdminMenuState.adding_item_price)
+async def admin_menu_add_item_price(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if not msg.text or not msg.text.strip().isdigit():
+        await msg.answer("⚠️ Iltimos, faqat son kiriting (masalan 25000).")
+        return
+    price = int(msg.text.strip())
+    data = await state.get_data()
+    cat_idx = data["am_cat_idx"]
+    name = data["am_new_name"]
+    cat = list(RAW_MENU.keys())[cat_idx]
+    RAW_MENU[cat][name] = price
+    rebuild_menu_caches()
+    save_menu()
+    await state.set_state(AdminMenuState.choosing_item)
+    await msg.answer(f"✅ <b>{name}</b> — {fmt(price)} menyuga qo'shildi.", reply_markup=admin_items_kb(cat_idx))
+
+@dp.callback_query(F.data == "amaddcat")
+async def admin_menu_add_category_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.set_state(AdminMenuState.adding_category_name)
+    await cb.message.edit_text("➕ Yangi kategoriya nomini kiriting (masalan: 🍰 Desertlar):")
+    await cb.answer()
+
+@dp.message(AdminMenuState.adding_category_name)
+async def admin_menu_add_category_save(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    name = msg.text.strip() if msg.text else ""
+    if not name:
+        await msg.answer("⚠️ Iltimos, kategoriya nomini kiriting.")
+        return
+    if name in RAW_MENU:
+        await msg.answer("⚠️ Bu kategoriya allaqachon mavjud.")
+        return
+    RAW_MENU[name] = {}
+    rebuild_menu_caches()
+    save_menu()
+    await state.set_state(AdminMenuState.choosing_category)
+    await msg.answer(f"✅ <b>{name}</b> kategoriyasi qo'shildi.", reply_markup=admin_menu_categories_kb())
+
+@dp.message(Command("orders"))
+async def admin_orders(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer(build_orders_text())
+
+# ──────────────────────────────────────────
+# ADMIN YORDAMCHISI: oddiy rasm yuborilsa file_id ko'rsatish
+# (taom rasmlari endi /admin → Menyu boshqaruvi orqali biriktiriladi)
 # ──────────────────────────────────────────
 @dp.message(F.photo)
 async def admin_get_file_id(msg: Message):
@@ -969,7 +1439,7 @@ async def admin_get_file_id(msg: Message):
     file_id = msg.photo[-1].file_id
     await msg.answer(
         f"🖼 <b>file_id:</b>\n<code>{file_id}</code>\n\n"
-        "Shu ID ni CATEGORY_IMAGES lug'atiga tegishli kategoriya nomi ostiga qo'ying."
+        "Taomga rasm biriktirish uchun /admin → 🍽 Menyu boshqaruvi bo'limidan foydalaning."
     )
 
 # ──────────────────────────────────────────
